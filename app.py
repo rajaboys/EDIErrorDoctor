@@ -1,456 +1,494 @@
 """
-EDIErrorDoctor - Amazon Nova Hackathon 2025
-AI-powered X12 EDI debugging tool for healthcare revenue cycle teams.
+EDIErrorDoctor — AI-powered X12 EDI & HL7 v2 Debugging Tool
+Powered by Amazon Nova Pro via Amazon Bedrock
+Built for Amazon Nova AI Hackathon 2026
 """
 
 import streamlit as st
-import json
-from pathlib import Path
-from utils.edi_parser import parse_edi_file, EDIParseResult
-from utils.nova_client import analyze_edi_with_nova, analyze_image_with_nova
-from utils.guardrails import check_for_phi
-from utils.report_export import generate_report
+import os
+import sys
+from datetime import datetime
 
-# ── Page config ──────────────────────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from edi_parser import (
+    parse_segments, detect_transaction_type, extract_snip_errors,
+    segments_to_text, summarize_edi
+)
+from hl7_parser import (
+    parse_hl7_segments, detect_hl7_message_type, extract_hl7_errors,
+    summarize_hl7, is_hl7_message
+)
+from nova_client import analyze_edi_with_nova, analyze_eob_image_with_nova, NOVA_PRO, NOVA_LITE
+
+# ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="EDIErrorDoctor",
-    page_icon="🩺",
+    page_icon="🏥",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# ── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 
-:root {
-    --bg:       #0d1117;
-    --surface:  #161b22;
-    --border:   #30363d;
-    --accent:   #58a6ff;
-    --green:    #3fb950;
-    --red:      #f85149;
-    --yellow:   #d29922;
-    --text:     #e6edf3;
-    --muted:    #8b949e;
-    --mono:     'IBM Plex Mono', monospace;
-    --sans:     'IBM Plex Sans', sans-serif;
-}
+    /* ── Global Reset ── */
+    html, body, [class*="css"] {
+        font-family: 'DM Sans', sans-serif;
+        background-color: #F7F9FC;
+        color: #1A2B3C;
+    }
+    code, pre, .stCode { font-family: 'DM Mono', monospace !important; }
 
-html, body, [class*="css"] {
-    font-family: var(--sans);
-    background-color: var(--bg);
-    color: var(--text);
-}
+    /* ── Streamlit overrides ── */
+    .stApp { background-color: #F7F9FC; }
+    .stSidebar { background-color: #FFFFFF !important; border-right: 1px solid #E2E8F0; }
+    .stSidebar .stMarkdown { color: #4A5568; }
+    section[data-testid="stSidebar"] { background-color: #FFFFFF !important; }
+    .stButton > button {
+        background: #FFFFFF; color: #1A56DB; border: 1.5px solid #1A56DB;
+        border-radius: 8px; font-weight: 500; transition: all 0.2s;
+        font-family: 'DM Sans', sans-serif;
+    }
+    .stButton > button:hover {
+        background: #1A56DB; color: #FFFFFF; border-color: #1A56DB;
+    }
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #1A56DB 0%, #0E3FA8 100%);
+        color: white; border: none; padding: 0.75rem 1.5rem;
+        font-size: 1rem; font-weight: 600; border-radius: 10px;
+        box-shadow: 0 4px 14px rgba(26,86,219,0.35);
+    }
+    .stButton > button[kind="primary"]:hover {
+        box-shadow: 0 6px 20px rgba(26,86,219,0.5); transform: translateY(-1px);
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        background: #FFFFFF; border-radius: 10px; padding: 4px;
+        border: 1px solid #E2E8F0; gap: 4px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px; padding: 8px 20px;
+        color: #64748B; font-weight: 500;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #1A56DB !important; color: white !important;
+    }
+    .stSelectbox > div, .stRadio > div { color: #1A2B3C; }
+    .stExpander { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; }
+    .stExpander header { font-weight: 500; color: #1A2B3C; }
+    div[data-testid="stFileUploader"] {
+        background: #FFFFFF; border: 2px dashed #CBD5E1;
+        border-radius: 12px; padding: 1rem;
+    }
+    textarea { background: #FFFFFF !important; border: 1px solid #E2E8F0 !important;
+               border-radius: 8px !important; color: #1A2B3C !important;
+               font-family: 'DM Mono', monospace !important; font-size: 0.82rem !important; }
 
-/* Sidebar */
-[data-testid="stSidebar"] {
-    background-color: var(--surface);
-    border-right: 1px solid var(--border);
-}
+    /* ── Header ── */
+    .main-header {
+        background: linear-gradient(135deg, #1A56DB 0%, #0E3FA8 60%, #0A2D7A 100%);
+        padding: 2rem 2.5rem; border-radius: 16px; margin-bottom: 1.5rem;
+        box-shadow: 0 8px 32px rgba(26,86,219,0.25);
+        display: flex; align-items: center; gap: 1.5rem;
+    }
+    .main-header-icon {
+        font-size: 3rem; background: rgba(255,255,255,0.15);
+        border-radius: 12px; padding: 0.5rem 0.75rem; line-height: 1;
+    }
+    .main-header h1 { color: #FFFFFF; margin: 0; font-size: 1.9rem; font-weight: 600; letter-spacing: -0.5px; }
+    .main-header p { color: rgba(255,255,255,0.75); margin: 0.3rem 0 0; font-size: 0.95rem; }
+    .main-header-badge {
+        margin-left: auto; background: rgba(255,255,255,0.15);
+        border: 1px solid rgba(255,255,255,0.3); border-radius: 20px;
+        padding: 0.3rem 0.9rem; color: white; font-size: 0.8rem; white-space: nowrap;
+    }
 
-/* Header */
-.edi-header {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    padding: 1.5rem 0 1rem;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 1.5rem;
-}
-.edi-header .logo {
-    font-size: 2.2rem;
-    line-height: 1;
-}
-.edi-header h1 {
-    font-size: 1.7rem;
-    font-weight: 700;
-    color: var(--text);
-    margin: 0;
-    letter-spacing: -0.02em;
-}
-.edi-header .sub {
-    font-size: 0.78rem;
-    color: var(--muted);
-    font-family: var(--mono);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-}
+    /* ── Metric Cards ── */
+    .metric-box {
+        background: #FFFFFF; border: 1px solid #E2E8F0;
+        border-radius: 12px; padding: 1.25rem 1rem;
+        text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .metric-box:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0,0,0,0.1); }
+    .metric-box .num { font-size: 2.2rem; font-weight: 700; font-family: 'DM Mono'; line-height: 1; }
+    .metric-box .label { color: #64748B; font-size: 0.8rem; margin-top: 0.3rem; text-transform: uppercase; letter-spacing: 0.5px; }
+    .metric-box.total .num { color: #1A56DB; }
+    .metric-box.fatal .num { color: #DC2626; }
+    .metric-box.error .num { color: #EA580C; }
+    .metric-box.warning .num { color: #D97706; }
 
-/* Metric cards */
-.metric-row { display: flex; gap: 12px; margin-bottom: 1.5rem; flex-wrap: wrap; }
-.metric-card {
-    flex: 1; min-width: 130px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1rem 1.2rem;
-}
-.metric-card .val { font-size: 1.8rem; font-weight: 700; font-family: var(--mono); }
-.metric-card .lbl { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 2px; }
-.metric-card.red   .val { color: var(--red); }
-.metric-card.yellow .val { color: var(--yellow); }
-.metric-card.green  .val { color: var(--green); }
-.metric-card.blue   .val { color: var(--accent); }
+    /* ── Error Cards ── */
+    .error-card {
+        border-left: 4px solid #DC2626; background: #FFF5F5;
+        padding: 1rem 1.25rem; border-radius: 0 10px 10px 0;
+        margin: 0.5rem 0; box-shadow: 0 2px 6px rgba(220,38,38,0.08);
+    }
+    .warning-card {
+        border-left: 4px solid #D97706; background: #FFFBEB;
+        padding: 1rem 1.25rem; border-radius: 0 10px 10px 0;
+        margin: 0.5rem 0; box-shadow: 0 2px 6px rgba(217,119,6,0.08);
+    }
+    .success-card {
+        border-left: 4px solid #059669; background: #F0FDF4;
+        padding: 1rem 1.25rem; border-radius: 0 10px 10px 0;
+        margin: 0.5rem 0; box-shadow: 0 2px 6px rgba(5,150,105,0.08);
+    }
 
-/* Error item */
-.error-item {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--red);
-    border-radius: 6px;
-    padding: 1rem 1.2rem;
-    margin-bottom: 0.8rem;
-}
-.error-item.warning { border-left-color: var(--yellow); }
-.error-item .seg {
-    font-family: var(--mono);
-    font-size: 0.82rem;
-    color: var(--accent);
-    margin-bottom: 6px;
-}
-.error-item .msg { font-size: 0.93rem; color: var(--text); }
-.error-item .fix {
-    margin-top: 8px;
-    font-size: 0.85rem;
-    color: var(--muted);
-    font-family: var(--mono);
-    background: rgba(88,166,255,0.07);
-    border-radius: 4px;
-    padding: 6px 10px;
-}
+    /* ── Severity badges ── */
+    .severity-fatal { color: #DC2626; font-weight: 700; }
+    .severity-error { color: #EA580C; font-weight: 600; }
+    .severity-warning { color: #D97706; font-weight: 500; }
+    .severity-info { color: #0284C7; }
 
-/* Code block override */
-.stCode, pre {
-    font-family: var(--mono) !important;
-    background: #0d1117 !important;
-    border: 1px solid var(--border) !important;
-    border-radius: 6px !important;
-}
+    /* ── SNIP badge ── */
+    .snip-badge {
+        display: inline-block; background: #EFF6FF; color: #1A56DB;
+        border: 1px solid #BFDBFE; padding: 2px 8px; border-radius: 20px;
+        font-family: 'DM Mono'; font-size: 0.72rem; margin-right: 0.4rem;
+        font-weight: 500;
+    }
 
-/* Buttons */
-.stButton > button {
-    background: var(--accent) !important;
-    color: #0d1117 !important;
-    font-weight: 600 !important;
-    border: none !important;
-    border-radius: 6px !important;
-    font-family: var(--sans) !important;
-}
-.stButton > button:hover { opacity: 0.85 !important; }
+    /* ── EDI code box ── */
+    .edi-box {
+        background: #F8FAFC; border: 1px solid #E2E8F0;
+        padding: 1rem; border-radius: 8px; font-family: 'DM Mono';
+        font-size: 0.8rem; white-space: pre-wrap; color: #1E3A5F;
+        max-height: 300px; overflow-y: auto;
+    }
 
-/* Tabs */
-[data-baseweb="tab-list"] { border-bottom: 1px solid var(--border) !important; }
-[data-baseweb="tab"] { font-family: var(--sans) !important; color: var(--muted) !important; }
-[aria-selected="true"] { color: var(--accent) !important; }
+    /* ── Section headers ── */
+    .section-header {
+        font-size: 1.1rem; font-weight: 600; color: #1A2B3C;
+        border-bottom: 2px solid #E2E8F0; padding-bottom: 0.5rem;
+        margin: 1.5rem 0 1rem;
+    }
 
-/* Success/error banners */
-.stAlert { border-radius: 6px !important; }
+    /* ── Sidebar section labels ── */
+    .sidebar-section {
+        font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 1px; color: #94A3B8; margin: 1rem 0 0.4rem;
+    }
 
-/* Section labels */
-.section-label {
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: var(--muted);
-    font-family: var(--mono);
-    margin-bottom: 8px;
-    margin-top: 1.5rem;
-}
+    /* ── Summary box ── */
+    .summary-box {
+        background: #EFF6FF; border: 1px solid #BFDBFE;
+        border-radius: 10px; padding: 1rem 1.25rem; margin: 1rem 0;
+        color: #1E40AF; font-size: 0.92rem;
+    }
 
-.snip-badge {
-    display: inline-block;
-    font-family: var(--mono);
-    font-size: 0.72rem;
-    padding: 2px 8px;
-    border-radius: 4px;
-    background: rgba(88,166,255,0.12);
-    color: var(--accent);
-    border: 1px solid rgba(88,166,255,0.3);
-    margin-right: 6px;
-}
+    /* ── Footer ── */
+    .footer-note {
+        text-align: center; color: #94A3B8; font-size: 0.78rem;
+        padding: 1rem 0; border-top: 1px solid #E2E8F0; margin-top: 2rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-
-# ── Header ────────────────────────────────────────────────────────────────────
+# ── Header ───────────────────────────────────────────────────────────────────
 st.markdown("""
-<div class="edi-header">
-  <div class="logo">🩺</div>
-  <div>
-    <h1>EDIErrorDoctor</h1>
-    <div class="sub">Amazon Nova · X12 EDI Diagnostics · Healthcare Revenue Cycle</div>
-  </div>
+<div class="main-header">
+    <div class="main-header-icon">🏥</div>
+    <div>
+        <h1>EDIErrorDoctor</h1>
+        <p>AI-powered X12 EDI &amp; HL7 v2 analysis · Powered by Amazon Nova Pro on Bedrock</p>
+    </div>
+    <div class="main-header-badge">🔒 100% Synthetic Data</div>
 </div>
 """, unsafe_allow_html=True)
 
-
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Configuration")
+    st.markdown('<div class="sidebar-section">⚙️ Configuration</div>', unsafe_allow_html=True)
 
-    aws_region = st.selectbox(
-        "AWS Region",
-        ["us-east-1", "us-west-2", "eu-west-1"],
-        index=0,
-    )
-    nova_model = st.selectbox(
+    aws_region = st.selectbox("AWS Region", ["us-east-1", "us-west-2", "eu-west-1"], index=0)
+    model_choice = st.radio(
         "Nova Model",
-        ["amazon.nova-pro-v1:0", "amazon.nova-lite-v1:0", "amazon.nova-micro-v1:0"],
-        index=0,
-        help="Nova Pro recommended for complex 837/835 analysis"
+        ["Nova Pro (Highest accuracy)", "Nova Lite (Faster)"],
+        index=0
     )
-    guardrails_on = st.toggle("Bedrock Guardrails (PHI detection)", value=True)
+    model_id = NOVA_PRO if "Pro" in model_choice else NOVA_LITE
 
-    st.divider()
-    st.markdown("### 📂 Load Sample Files")
-    sample_dir = Path(__file__).parent / "synthetic_edi"
-    samples = list(sample_dir.glob("*.edi")) if sample_dir.exists() else []
-    if samples:
-        chosen = st.selectbox("Synthetic test file", ["— choose —"] + [f.name for f in samples])
-        if chosen != "— choose —":
-            st.session_state["sample_loaded"] = (sample_dir / chosen).read_text()
-            st.success(f"Loaded: {chosen}")
-    else:
-        st.info("No sample files found. Run `python synthetic_edi/generate_samples.py` first.")
+    st.markdown("---")
+    st.markdown('<div class="sidebar-section">📋 About</div>', unsafe_allow_html=True)
+    st.markdown("""
+    Analyzes **X12 EDI** transactions:
+    - **837P/I** — Professional & Institutional Claims
+    - **835** — Electronic Remittance Advice
+    - **278** — Prior Authorization
+    - **270/271** — Eligibility
+    - **276/277** — Claim Status
 
-    st.divider()
-    st.markdown(
-        "<div style='font-size:0.72rem; color:#8b949e;'>"
-        "⚠️ Demo uses 100% synthetic data.<br>No real PHI is ever processed."
-        "</div>", unsafe_allow_html=True
-    )
+    Analyzes **HL7 v2** messages:
+    - **ADT** — Admit/Discharge/Transfer
+    - **ORU** — Lab & Observation Results
+    - **ORM** — Orders
 
+    Checks **SNIP Levels 1–7** including syntax, business rules, and payer edits.
 
-# ── Main tabs ─────────────────────────────────────────────────────────────────
-tab_text, tab_image, tab_about = st.tabs(["📄 EDI Text Analysis", "🖼️ EOB Image (Multimodal)", "ℹ️ About"])
+    🖼️ *Multimodal EOB image analysis supported.*
 
+    ⚠️ *Demo uses 100% synthetic data. No PHI is processed.*
+    """)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — EDI Text Analysis
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_text:
-    col_upload, col_or, col_paste = st.columns([3, 0.3, 3])
-
-    with col_upload:
-        st.markdown('<div class="section-label">Upload EDI File</div>', unsafe_allow_html=True)
-        uploaded = st.file_uploader(
-            "Drop .edi / .txt / .x12 file here",
-            type=["edi", "txt", "x12"],
-            label_visibility="collapsed",
-        )
-
-    with col_or:
-        st.markdown("<br><br><center style='color:#8b949e;font-size:0.8rem;'>— or —</center>", unsafe_allow_html=True)
-
-    with col_paste:
-        st.markdown('<div class="section-label">Paste EDI Directly</div>', unsafe_allow_html=True)
-        default_text = st.session_state.get("sample_loaded", "")
-        edi_text_input = st.text_area(
-            "Paste raw X12 EDI here",
-            value=default_text,
-            height=150,
-            placeholder="ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       *230101*1200*^*00501*000000001*0*T*:~\n...",
-            label_visibility="collapsed",
-        )
-
-    # Resolve final EDI text
-    edi_raw = None
-    if uploaded:
-        edi_raw = uploaded.read().decode("utf-8", errors="replace")
-        st.success(f"✅ File loaded: `{uploaded.name}` ({len(edi_raw):,} chars)")
-    elif edi_text_input.strip():
-        edi_raw = edi_text_input.strip()
-
-    st.markdown('<div class="section-label">Transaction Type</div>', unsafe_allow_html=True)
-    tx_type = st.radio(
-        "Transaction type",
-        ["Auto-detect", "837P (Professional)", "837I (Institutional)", "835 ERA", "278 Prior Auth", "270/271 Eligibility"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    run_btn = st.button("🔍 Analyze with Amazon Nova", disabled=(edi_raw is None), use_container_width=True)
-
-    if run_btn and edi_raw:
-        # PHI guardrail check
-        if guardrails_on:
-            phi_result = check_for_phi(edi_raw)
-            if phi_result["detected"]:
-                st.error(
-                    f"🛑 **Guardrail triggered**: Possible PHI pattern detected "
-                    f"(`{phi_result['pattern']}`). Please use synthetic data only."
-                )
-                st.stop()
-
-        with st.spinner("Parsing EDI structure…"):
-            parse_result: EDIParseResult = parse_edi_file(edi_raw, tx_type)
-
-        with st.spinner("Consulting Amazon Nova…"):
-            nova_result = analyze_edi_with_nova(
-                edi_raw, parse_result, nova_model, aws_region
-            )
-
-        # ── Summary metrics ──
-        errors   = nova_result.get("errors", [])
-        warnings = nova_result.get("warnings", [])
-        n_segs   = parse_result.segment_count
-        snip_lvl = parse_result.highest_snip_level
-
+    # Tech Stack & Roadmap image
+    roadmap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                  "data", "synthetic_edi", "EDIErrorDoctor_TechStack_Roadmap.png")
+    if os.path.exists(roadmap_path):
+        import base64
+        with open(roadmap_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
         st.markdown(f"""
-        <div class="metric-row">
-          <div class="metric-card red">
-            <div class="val">{len(errors)}</div>
-            <div class="lbl">Errors</div>
-          </div>
-          <div class="metric-card yellow">
-            <div class="val">{len(warnings)}</div>
-            <div class="lbl">Warnings</div>
-          </div>
-          <div class="metric-card blue">
-            <div class="val">{n_segs}</div>
-            <div class="lbl">Segments</div>
-          </div>
-          <div class="metric-card {'green' if snip_lvl >= 5 else 'yellow'}">
-            <div class="val">L{snip_lvl}</div>
-            <div class="lbl">SNIP Level</div>
-          </div>
-        </div>
+        <a href="data:image/png;base64,{b64}" target="_blank"
+           style="display:inline-flex; align-items:center; gap:6px;
+                  background:#EFF6FF; border:1.5px solid #BFDBFE;
+                  border-radius:8px; padding:8px 14px;
+                  color:#1A56DB; font-weight:600; font-size:0.9rem;
+                  text-decoration:none;">
+            🗺️ View Tech Stack &amp; Roadmap ↗
+        </a>
         """, unsafe_allow_html=True)
 
-        # ── Tabs: Errors / Fix / Clean EDI / Raw JSON ──
-        r1, r2, r3, r4 = st.tabs(["🚨 Errors & Explanations", "🔧 Fix Suggestions", "✅ Corrected EDI", "📋 Raw Analysis"])
+    st.markdown("---")
+    st.markdown('<div class="sidebar-section">🧪 Load Sample Files</div>', unsafe_allow_html=True)
 
-        with r1:
-            if not errors and not warnings:
-                st.success("No errors found — EDI appears valid!")
-            for e in errors:
-                snip = f'<span class="snip-badge">SNIP {e.get("snip_level","?")}</span>' if e.get("snip_level") else ""
-                st.markdown(f"""
-                <div class="error-item">
-                  <div class="seg">{snip}{e.get('segment','')}</div>
-                  <div class="msg">💬 {e.get('explanation', e.get('message',''))}</div>
-                  {'<div class="fix">→ ' + e.get('fix_hint','') + '</div>' if e.get('fix_hint') else ''}
-                </div>
-                """, unsafe_allow_html=True)
-            for w in warnings:
-                st.markdown(f"""
-                <div class="error-item warning">
-                  <div class="seg">{w.get('segment','')}</div>
-                  <div class="msg">⚠️ {w.get('explanation', w.get('message',''))}</div>
-                </div>
-                """, unsafe_allow_html=True)
+    sample_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "synthetic_edi")
+    sample_files = {
+        "── X12 EDI ──": None,
+        "837P — Professional Claim (errors)": "837P_with_errors.edi",
+        "837P — Duplicate Claim (errors)": "837P_duplicate_claim_errors.edi",
+        "837I — Institutional Claim (errors)": "837I_institutional_errors.edi",
+        "835 — ERA Remittance (errors)": "835_ERA_with_errors.edi",
+        "835 — ERA Denial (errors)": "835_ERA_denial_errors.edi",
+        "278 — Prior Auth (errors)": "278_PriorAuth_with_errors.edi",
+        "270 — Eligibility Inquiry (errors)": "270_Eligibility_errors.edi",
+        "276 — Claim Status Request (errors)": "276_ClaimStatus_errors.edi",
+        "── HL7 v2 ──": None,
+        "HL7 ADT^A01 — Admission (errors)": "HL7_ADT_A01_with_errors.hl7",
+        "HL7 ADT^A08 — Patient Update (errors)": "HL7_ADT_A08_patient_update.hl7",
+        "HL7 ORU^R01 — Lab Results (errors)": "HL7_ORU_R01_with_errors.hl7",
+        "HL7 ORM^O01 — Lab Order (errors)": "HL7_ORM_O01_with_errors.hl7",
+    }
+    for label, fname in sample_files.items():
+        if fname is None:
+            st.markdown(f"**{label}**")
+            continue
+        fpath = os.path.join(sample_dir, fname)
+        if os.path.exists(fpath):
+            if st.button(f"📂 {label}", use_container_width=True):
+                with open(fpath) as f:
+                    st.session_state["loaded_edi"] = f.read()
+                    st.session_state["loaded_label"] = label
+                    st.session_state.pop("last_results", None)
+                    st.session_state.pop("last_edi", None)
 
-        with r2:
-            summary = nova_result.get("fix_summary", "")
-            if summary:
-                st.markdown(f"**Nova's Fix Plan:**\n\n{summary}")
-            st.divider()
-            for i, e in enumerate(errors, 1):
-                if e.get("corrected_segment"):
-                    st.markdown(f"**Fix {i} — `{e.get('segment','')}`**")
-                    cols = st.columns(2)
-                    with cols[0]:
-                        st.caption("Original")
-                        st.code(e.get("original_segment", "—"), language="text")
-                    with cols[1]:
-                        st.caption("Corrected")
-                        st.code(e.get("corrected_segment"), language="text")
+# ── Main Tabs ────────────────────────────────────────────────────────────────
+tab_edi, tab_image, tab_about = st.tabs([
+    "📄 EDI Text Analysis",
+    "🖼️ EOB Image Analysis (Multimodal)",
+    "🚀 Tech Stack & Roadmap"
+])
 
-        with r3:
-            clean_edi = nova_result.get("corrected_edi", "")
-            if clean_edi:
-                st.code(clean_edi, language="text")
-                st.download_button(
-                    "⬇️ Download Corrected EDI",
-                    data=clean_edi,
-                    file_name="corrected_claim.edi",
-                    mime="text/plain",
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1: EDI TEXT ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_edi:
+    col_upload, col_paste = st.columns([1, 2])
+
+    with col_upload:
+        st.markdown("#### Upload EDI File")
+        uploaded = st.file_uploader("Upload .edi, .txt, .x12 or .hl7 file", type=["edi", "txt", "x12", "hl7"])
+        if uploaded:
+            st.session_state["loaded_edi"] = uploaded.read().decode("utf-8", errors="replace")
+            st.session_state["loaded_label"] = uploaded.name
+            st.session_state.pop("last_results", None)
+            st.session_state.pop("last_edi", None)
+
+    with col_paste:
+        st.markdown("#### Or Paste EDI Content")
+        default_text = st.session_state.get("loaded_edi", "")
+        edi_input = st.text_area(
+            "Paste raw X12 EDI here",
+            value=default_text,
+            height=200,
+            placeholder="ISA*00*          *00*          *ZZ*...",
+            label_visibility="collapsed"
+        )
+
+    if edi_input.strip():
+        # Auto-detect format
+        is_hl7 = is_hl7_message(edi_input)
+
+        if is_hl7:
+            segments = parse_hl7_segments(edi_input)
+            tx_type = detect_hl7_message_type(segments)
+            pre_issues = extract_hl7_errors(segments, tx_type)
+            summary_text = summarize_hl7(segments, tx_type)
+            format_badge = "🏥 HL7 v2"
+        else:
+            segments = parse_segments(edi_input)
+            tx_type = detect_transaction_type(segments)
+            pre_issues = extract_snip_errors(segments, tx_type)
+            summary_text = summarize_edi(segments, tx_type)
+            format_badge = "📋 X12 EDI"
+
+        st.markdown("---")
+        st.markdown(f"**Format:** `{format_badge}` &nbsp;|&nbsp; **Detected:** `{tx_type}` &nbsp;|&nbsp; **Pre-validation issues:** `{len(pre_issues)}`")
+        st.markdown(summary_text)
+
+        analyze_btn = st.button("🔍 Analyze with Amazon Nova", type="primary", use_container_width=True)
+
+        if analyze_btn:
+            with st.spinner(f"Sending to Amazon Nova... analyzing EDI..."):
+                results = analyze_edi_with_nova(
+                    edi_text=edi_input,
+                    pre_validation_issues=pre_issues,
+                    transaction_type=tx_type,
+                    model_id=model_id,
+                    region=aws_region
                 )
+            st.session_state["last_results"] = results
+            st.session_state["last_edi"] = edi_input
+
+        # Display results
+        if "last_results" in st.session_state:
+            results = st.session_state["last_results"]
+
+            if results.get("error"):
+                st.error(f"❌ {results['message']}")
             else:
-                st.info("No corrected EDI generated (file may be valid or errors too severe).")
+                st.markdown("## 📊 Analysis Results")
 
-        with r4:
-            st.json(nova_result)
-            report_md = generate_report(parse_result, nova_result)
-            st.download_button(
-                "⬇️ Export Markdown Report",
-                data=report_md,
-                file_name="edi_analysis_report.md",
-                mime="text/markdown",
-            )
+                # Metrics row
+                errors = results.get("errors", [])
+                fatal = sum(1 for e in errors if e.get("severity") == "FATAL")
+                errs  = sum(1 for e in errors if e.get("severity") == "ERROR")
+                warns = sum(1 for e in errors if e.get("severity") == "WARNING")
 
+                m1, m2, m3, m4 = st.columns(4)
+                m1.markdown(f'<div class="metric-box total"><div class="num">{len(errors)}</div><div class="label">Total Issues</div></div>', unsafe_allow_html=True)
+                m2.markdown(f'<div class="metric-box fatal"><div class="num">{fatal}</div><div class="label">Fatal</div></div>', unsafe_allow_html=True)
+                m3.markdown(f'<div class="metric-box error"><div class="num">{errs}</div><div class="label">Errors</div></div>', unsafe_allow_html=True)
+                m4.markdown(f'<div class="metric-box warning"><div class="num">{warns}</div><div class="label">Warnings</div></div>', unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Multimodal EOB Image
-# ═══════════════════════════════════════════════════════════════════════════════
+                st.markdown(f'<div class="summary-box">📝 <strong>Summary:</strong> {results.get("summary", "")}</div>', unsafe_allow_html=True)
+
+                rc_impact = results.get("revenue_cycle_impact", "")
+                if rc_impact:
+                    st.warning(f"💰 **Revenue Cycle Impact:** {rc_impact}")
+
+                priority = results.get("priority_fixes", [])
+                if priority:
+                    st.info("🎯 **Priority Fixes:**\n" + "\n".join(f"{i+1}. {p}" for i, p in enumerate(priority)))
+
+                # Error detail cards
+                st.markdown("### 🔎 Detailed Error Analysis")
+                for i, err in enumerate(errors):
+                    sev = err.get("severity", "INFO")
+
+                    with st.expander(
+                        f"[SNIP {err.get('snip_level','?')}] {err.get('segment_id','?')} "
+                        f"— {err.get('plain_english','')[:80]}",
+                        expanded=(i < 3)
+                    ):
+                        cols = st.columns([1, 2])
+                        with cols[0]:
+                            st.markdown(f"**Severity:** `{sev}`")
+                            st.markdown(f"**SNIP Level:** `{err.get('snip_level')}`")
+                            st.markdown(f"**Segment:** `{err.get('segment_id')}`")
+                            st.markdown(f"**Loop:** `{err.get('loop', 'N/A')}`")
+                            st.markdown(f"**Element:** `{err.get('element_position', 'N/A')}`")
+                        with cols[1]:
+                            st.markdown(f"**Plain English:**\n{err.get('plain_english', '')}")
+                            st.markdown(f"**Technical Detail:**\n{err.get('technical_detail', '')}")
+                            st.markdown(f"**Fix:** {err.get('fix_explanation', '')}")
+
+                        if err.get("original_segment"):
+                            st.markdown("**❌ Original:**")
+                            st.code(err["original_segment"], language="text")
+                        if err.get("corrected_segment"):
+                            st.markdown("**✅ Corrected:**")
+                            st.code(err["corrected_segment"], language="text")
+
+                # Corrected EDI output
+                if results.get("corrected_edi_snippet"):
+                    st.markdown("### ✅ Corrected EDI Output")
+                    st.code(results["corrected_edi_snippet"], language="text")
+                    ts = datetime.now().strftime("%Y%m%d%H%M")
+                    tx_short = tx_type.split()[0].replace("/", "") if tx_type else "EDI"
+                    download_filename = f"{tx_short}_corrected_{ts}.edi"
+                    st.download_button(
+                        "⬇️ Download Corrected EDI",
+                        data=results["corrected_edi_snippet"],
+                        file_name=download_filename,
+                        mime="text/plain"
+                    )
+                    st.caption("⚠️ The corrected EDI addresses the identified errors. A full re-validation against your payer's companion guide is recommended before submission.")
+
+                # Raw JSON
+                with st.expander("🔧 Raw JSON Response"):
+                    st.json(results)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2: EOB IMAGE ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
 with tab_image:
-    st.markdown("### Upload Scanned EOB / Remittance Image")
-    st.caption("Nova will extract key data and map it to EDI 835 equivalents, identifying discrepancies.")
+    st.markdown("### 🖼️ EOB / Remittance Image Analysis")
+    st.info("Upload a scanned EOB or paper remittance document. Nova will extract key data fields and map them to X12 835 EDI equivalents.")
 
     img_file = st.file_uploader(
-        "Upload EOB image (PNG, JPG, PDF)",
-        type=["png", "jpg", "jpeg", "pdf"],
-        label_visibility="collapsed",
+        "Upload scanned EOB image",
+        type=["jpg", "jpeg", "png", "pdf"],
+        key="eob_upload"
     )
+
     if img_file:
-        st.image(img_file, caption="Uploaded EOB", use_column_width=True)
-        if st.button("🔍 Analyze EOB with Nova Vision"):
-            with st.spinner("Nova is reading the EOB…"):
-                result = analyze_image_with_nova(img_file.read(), img_file.type, nova_model, aws_region)
-            st.subheader("Extracted Data")
-            st.json(result.get("extracted_data", {}))
-            st.subheader("835 Mapping & Issues")
-            for issue in result.get("issues", []):
-                st.warning(f"**{issue['field']}**: {issue['description']}")
-    else:
-        st.info("Upload a scanned EOB, paper remittance, or explanation of benefits to begin.")
+        media_type = "image/jpeg" if img_file.type in ("image/jpeg",) else "image/png"
+        st.image(img_file, caption="Uploaded EOB", use_container_width=True)
 
+        if st.button("🔍 Extract & Map with Nova", type="primary"):
+            with st.spinner("Nova is reading your EOB image..."):
+                img_bytes = img_file.read()
+                img_result = analyze_eob_image_with_nova(img_bytes, media_type, model_id, aws_region)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — About
-# ═══════════════════════════════════════════════════════════════════════════════
+            if img_result.get("error"):
+                st.error(img_result["message"])
+            else:
+                st.markdown("### 📋 Extracted Data")
+                st.json(img_result.get("extracted_data", {}))
+
+                st.markdown("### 🔗 EDI Field Mappings")
+                mappings = img_result.get("edi_mappings", {})
+                if mappings:
+                    for field, mapping in mappings.items():
+                        st.markdown(f"- **{field}** → `{mapping}`")
+
+                if img_result.get("suggested_835_segments"):
+                    st.markdown("### 📝 Suggested 835 Segments")
+                    st.code(img_result["suggested_835_segments"], language="text")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3: TECH STACK & ROADMAP
+# ══════════════════════════════════════════════════════════════════════════════
 with tab_about:
-    st.markdown("""
-## About EDIErrorDoctor
+    st.markdown("### 🏥 EDIErrorDoctor — Technology Stack & Future Roadmap")
+    st.markdown("*Built for Amazon Nova AI Hackathon 2026 · Powered by Amazon Bedrock*")
+    st.markdown("---")
+    roadmap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                  "data", "synthetic_edi", "EDIErrorDoctor_TechStack_Roadmap.png")
+    if os.path.exists(roadmap_path):
+        st.image(roadmap_path, use_container_width=True)
+    else:
+        st.warning("⚠️ Roadmap image not found. Please copy EDIErrorDoctor_TechStack_Roadmap.png to data/synthetic_edi/")
 
-**EDIErrorDoctor** uses **Amazon Nova Pro** via Amazon Bedrock to provide AI-powered 
-diagnostics for X12 EDI healthcare transactions.
-
-### Supported Transaction Types
-| TX Set | Description |
-|--------|-------------|
-| **837P** | Professional claims |
-| **837I** | Institutional claims |
-| **835** | Electronic Remittance Advice |
-| **278** | Prior Authorization |
-| **270/271** | Eligibility Inquiry/Response |
-
-### SNIP Validation Levels
-| Level | Description |
-|-------|-------------|
-| 1 | Basic ISA/GS envelope integrity |
-| 2 | Syntactical requirements |
-| 3 | Balancing requirement |
-| 4 | Inter-segment syntax rules |
-| 5 | External code sets |
-| 6 | Internal code sets |
-| 7 | Product/provider approval |
-
-### Privacy & Compliance
-- ✅ 100% synthetic data in demo
-- ✅ Amazon Bedrock Guardrails for PHI detection
-- ✅ No data stored outside your AWS account
-- ✅ HIPAA-eligible AWS services used throughout
-
-### Architecture
-```
-User Upload → Streamlit UI
-    → PHI Guardrail Check (Bedrock)
-    → EDI Parser (Python)
-    → Amazon Nova Pro (Bedrock Converse API)
-    → Structured Error + Fix Response
-    → Corrected EDI Export
-```
-    """)
+# ── Footer ────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown("""
+<div class="footer-note">
+    🔒 All demo data is 100% synthetic. No real PHI is processed. &nbsp;|&nbsp;
+    Built for Amazon Nova AI Hackathon 2026 &nbsp;|&nbsp;
+    Powered by Amazon Bedrock · Nova Pro
+</div>
+""", unsafe_allow_html=True)
